@@ -28,7 +28,7 @@ export function hasSession() { return Boolean(session().MUSIC_U); }
 
 export function resetSession() {
   host.storage.set("sessionEpoch", (host.storage.get("sessionEpoch") || 0) + 1);
-  for (const key of ["cookies", "account", "likedIds", "likedAt"]) host.storage.remove(key);
+  for (const key of ["cookies", "account", "likedIds", "likedAt", "likedListId", "likedCover"]) host.storage.remove(key);
 }
 
 export function requireAccount() {
@@ -113,6 +113,8 @@ export async function verify(cookies = session(), checkCurrent = () => {}) {
   if (old?.id !== account.id) {
     host.storage.remove("likedIds");
     host.storage.remove("likedAt");
+    host.storage.remove("likedListId");
+    host.storage.remove("likedCover");
   }
   host.storage.set("account", account);
   return account;

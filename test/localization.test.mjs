@@ -87,6 +87,155 @@ test("收藏专辑兼容音乐库的数组读取，保留分页参数且空页�
   assert.ok(Array.isArray(await r.plugin.savedAlbums({ offset: 0 })));
 });
 
+test("收藏歌曲按收藏时间倒序，并缓存排序结果", async () => {
+  const r = await runtime("zh-CN");
+  r.store.set("cookies", { MUSIC_U: "fixture-session" });
+  r.store.set("account", { id: "42", name: "测试用户" });
+  r.env.reply = (payload) => {
+    if (payload.uid && payload.limit) return { code: 200, more: false, playlist: [{ id: 7, specialType: 5 }] };
+    if (payload.id === "7") return { code: 200, playlist: { trackIds: [{ id: 1, at: 100 }, { id: 2, at: 300 }, { id: 3, at: 200 }] } };
+    if (payload.c) {
+      return { code: 200, songs: JSON.parse(payload.c).map((x) => ({ id: x.id, name: `歌曲${x.id}`, ar: [], al: {}, dt: 1000 })), privileges: [] };
+    }
+    return { code: 200, ids: [1, 2, 3] };
+  };
+  const page = await r.plugin.liked({ offset: 0 });
+  assert.equal(page.tracks.map((t) => t.id).join(","), "2,3,1");
+  assert.equal(page.more, false);
+  // 详情请求必须带上按收藏时间排好的 id，而不是接口原始顺序。
+  assert.equal(r.requests.at(-1).payload.c, '[{"id":"2"},{"id":"3"},{"id":"1"}]');
+  // 只需要 trackIds，不拉整张歌单的详情。
+  assert.equal(r.requests.find((q) => q.payload.id === "7").payload.n, 0);
+  assert.equal(r.store.get("likedIds").join(","), "2,3,1");
+  const before = r.requests.length;
+  const cached = await r.plugin.liked({ offset: 0 });
+  // 排序结果走缓存：只多出本页的歌曲详情请求，不重新查找歌单。
+  assert.equal(r.requests.length, before + 1);
+  assert.equal(r.requests.filter((q) => q.payload.uid && q.payload.limit).length, 1);
+  assert.equal(cached.tracks.map((t) => t.id).join(","), "2,3,1");
+});
+
+test("拿不到收藏时间时退回 like/get 的原始顺序", async () => {
+  const r = await runtime("zh-CN");
+  r.store.set("cookies", { MUSIC_U: "fixture-session" });
+  r.store.set("account", { id: "42", name: "测试用户" });
+  r.env.reply = (payload) => {
+    if (payload.uid && payload.limit) return { code: 200, more: false, playlist: [{ id: 7, specialType: 0 }] };
+    if (payload.c) {
+      return { code: 200, songs: JSON.parse(payload.c).map((x) => ({ id: x.id, name: `歌曲${x.id}`, ar: [], al: {}, dt: 1000 })), privileges: [] };
+    }
+    return { code: 200, ids: [5, 4] };
+  };
+  const page = await r.plugin.liked({ offset: 0 });
+  assert.equal(page.tracks.map((t) => t.id).join(","), "5,4");
+});
+
+test("心动模式按当前歌曲续推，过滤 seed 与重复项", async () => {
+  const r = await runtime("zh-CN");
+  r.store.set("cookies", { MUSIC_U: "fixture-session" });
+  r.store.set("account", { id: "42", name: "测试用户" });
+  r.store.set("likedListId", "7");
+  const song = (id, name) => ({ id, name, ar: [{ id: 1, name: "歌手" }], al: { id: 2, name: "专辑" }, dt: 1000, privilege: { st: 0 } });
+  r.env.reply = (payload) => {
+    if (payload.type === "fromPlayOne") {
+      return { code: 200, data: [
+        { id: 1, songInfo: song(1, "推荐一") },
+        { id: 2, songInfo: song(2, "推荐二") },
+        { id: 3, songInfo: song(3, "推荐三") },
+        { id: 1, songInfo: song(1, "推荐一") },
+        { id: 99, songInfo: song(99, "当前歌曲") },
+      ] };
+    }
+    if (payload.c) return { code: 200, songs: [song(99, "当前歌曲")], privileges: [] };
+    return { code: 200, data: [] };
+  };
+  const page = await r.plugin.station({ id: "heartbeat", seed: "99" });
+  // 队首是 seed 本身：宿主换队列时会继续播完当前歌曲，再进入推荐
+  assert.equal(page.tracks.map((t) => t.id).join(","), "99,1,2,3");
+  assert.equal(page.more, true);
+  const request = r.requests.find((q) => q.payload.type === "fromPlayOne").payload;
+  assert.equal(request.songId, "99");
+  assert.equal(request.startMusicId, "99");
+  assert.equal(request.playlistId, "7");
+  assert.equal(request.count, 100);
+  assert.equal(r.requests.find((q) => q.payload.c).payload.c, '[{"id":"99"}]');
+
+  // 右键菜单把这首歌作为 seed 交给电台。
+  const action = r.plugin.menuAction({ id: "heartbeat", track: { id: "99" } });
+  assert.equal(action.station.id, "heartbeat");
+  assert.equal(action.station.seed, "99");
+  assert.ok(r.plugin.trackMenu().some((item) => item.id === "heartbeat"));
+
+  // 登录后首页有心动模式入口。
+  const home = await r.plugin.home();
+  assert.ok(home.sections.find((section) => section.style === "modes").modes.some((m) => m.station === "heartbeat"));
+});
+
+test("心动模式没有 seed 时用最近播放，未登录和未知电台给出对应错误", async () => {
+  const r = await runtime("zh-CN");
+  r.store.set("cookies", { MUSIC_U: "fixture-session" });
+  r.store.set("account", { id: "42", name: "测试用户" });
+  r.store.set("likedListId", "7");
+  r.env.reply = (payload) => {
+    if (payload.type === "fromPlayOne") return { code: 200, data: [{ songInfo: { id: 5, name: "推荐", ar: [], al: {}, dt: 1 } }] };
+    if (payload.limit === 50) return { code: 200, data: { list: [{ data: { id: 77, name: "最近播放", ar: [], al: {}, dt: 1 } }] } };
+    return { code: 200 };
+  };
+  await r.plugin.station({ id: "heartbeat" });
+  assert.equal(r.requests.find((q) => q.payload.type === "fromPlayOne").payload.songId, "77");
+  // 没有显式 seed 时不往队首塞歌，直接播推荐
+  assert.ok(!r.requests.some((q) => q.payload.c));
+  await assert.rejects(r.plugin.station({ id: "unknown" }), (e) => e.code === "unsupported");
+  const guest = await runtime("zh-CN");
+  await assert.rejects(guest.plugin.station({ id: "heartbeat", seed: "1" }), (e) => e.code === "signIn");
+});
+
+test("歌单详情带上心动模式电台 id", async () => {
+  const r = await runtime("zh-CN");
+  r.env.reply = () => ({
+    code: 200,
+    playlist: { id: 9, name: "测试歌单", trackCount: 0, trackIds: [], tracks: [], creator: { userId: 1 } },
+  });
+  const page = await r.plugin.playlist({ id: "9" });
+  assert.equal(page.station, "heartbeat");
+  assert.equal(page.name, "测试歌单");
+});
+
+test("首页把心动模式排在小行，前两张大卡有内容", async () => {
+  const r = await runtime("zh-CN");
+  r.store.set("cookies", { MUSIC_U: "fixture-session" });
+  r.store.set("account", { id: "42", name: "测试用户" });
+  const track = (id, name) => ({
+    id, name, ar: [{ id: 1, name: "歌手" }],
+    al: { id: 2, name: "专辑", picUrl: "http://p1.music.126.net/a.jpg" }, dt: 1000,
+  });
+  r.env.reply = (payload) => {
+    if (payload.limit === 24) {
+      return { code: 200, result: [
+        { id: 77, name: "推荐歌单一", picUrl: "http://p1.music.126.net/a.jpg", creator: { nickname: "网易云" }, playCount: 10, trackCount: 5 },
+        { id: 88, name: "推荐歌单二", picUrl: "http://p1.music.126.net/b.jpg", creator: { nickname: "网易云" }, playCount: 5, trackCount: 3 },
+      ] };
+    }
+    if (payload.uid) return { code: 200, playlist: [{ id: 7, specialType: 5, coverImgUrl: "http://p1.music.126.net/liked.jpg" }] };
+    if (payload.limit === 50) return { code: 200, data: { list: [{ data: track(5, "最近一") }] } };
+    return { code: 200, data: { dailySongs: [track(1, "日推一"), track(2, "日推二")] } };
+  };
+  const home = await r.plugin.home();
+  const modes = home.sections.find((s) => s.style === "modes").modes;
+  // 大卡：每日推荐 + 推荐歌单；小行：心动模式 / 我喜欢的音乐 / 最近播放，正好填满一行
+  assert.equal(modes.length, 5);
+  assert.equal(modes[0].tracks.map((t) => t.id).join(","), "1,2");
+  assert.equal(modes[1].playlist, "77");
+  assert.equal(modes[2].station, "heartbeat");
+  assert.equal(modes[3].playlist, "7");
+  assert.equal(modes[3].imageUrl, "http://p1.music.126.net/liked.jpg");
+  assert.equal(modes[4].tracks.map((t) => t.id).join(","), "5");
+  // 大卡用掉的推荐歌单不再重复出现在下面的歌单架里
+  assert.equal(home.sections.find((s) => s.style === "shelf").playlists.map((p) => p.id).join(","), "88");
+  // 有日推大卡时不再重复放每日推荐链接
+  assert.ok(!home.sections.some((s) => s.links?.some((l) => l.page === "daily")));
+});
+
 test("九种语言覆盖全部文案，动态占位符保持一致", () => {
   assert.deepEqual(Object.keys(dictionaries).sort(), ["de", "en", "es", "fr", "ja", "ko", "ru", "zh-CN", "zh-TW"].sort());
   for (const [locale, messages] of Object.entries(dictionaries)) {

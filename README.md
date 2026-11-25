@@ -28,6 +28,7 @@ Choose a quality in Settings → Plugins → NetEase Cloud Music → Settings. S
 ## Features
 
 - Home: recommended playlists, daily recommendations after sign-in, charts, new albums, and playlist categories
+- Home row band: Heartbeat mode (starts from the current song, lets it finish, then recommendations), Liked songs and Recently played; heartbeat is also in every track menu
 - Search tracks, albums, artists, and playlists, with pagination and search suggestions
 - Album, artist, and playlist pages, with playlist tracks loaded in their original order
 - Liked tracks, saved albums, personal playlists, and recent listening history; like/unlike tracks and save/unsave albums

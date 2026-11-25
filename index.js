@@ -191,7 +191,7 @@ export async function playlist({ id: value }) {
   const tracks = entries.length
     ? entries.map(({ id: trackId, added }) => attachAdded(known.get(trackId), added))
     : [...known.values()];
-  return { ...model.playlist(p, currentId()), tracks, trackCount: p.trackCount ?? tracks.length };
+  return { ...model.playlist(p, currentId()), station: HEARTBEAT, tracks, trackCount: p.trackCount ?? tracks.length };
 }
 
 export async function playlists() {
@@ -212,6 +212,37 @@ export async function playlists() {
     if (!j.more || !items.length) return result;
   }
   fail("unsupported", "账号歌单数量超过插件当前支持范围");
+}
+
+// 「我喜欢的音乐」歌单封面；只在第一次需要时取一次。
+async function likedCover(listId) {
+  const cached = host.storage.get("likedCover");
+  if (typeof cached === "string") return cached;
+  const j = await api("/api/v6/playlist/detail", { id: listId, n: 0, s: 0 });
+  const cover = String(j.playlist?.coverImgUrl || "");
+  host.storage.set("likedCover", cover);
+  return cover;
+}
+
+// 收藏时间由「我喜欢的音乐」歌单的 trackIds[].at 提供；like/get 只返回 id，顺序不是收藏时间。
+async function likedOrder(user) {
+  const listId = await likedPlaylistId(user);
+  if (!listId) return null;
+  let j;
+  try {
+    // n=0 只要 trackIds，不把整张歌单的歌曲详情一起拉下来。
+    j = await api("/api/v6/playlist/detail", { id: listId, n: 0, s: 0 });
+  } catch (e) {
+    // 缓存的歌单编号失效时清掉，下次重新查找；登录问题仍然原样上报。
+    if (e.code === "signIn") throw e;
+    host.storage.remove("likedListId");
+    return null;
+  }
+  const items = (j.playlist?.trackIds || []).map((x) => [String(x.id), Number(x.at) || 0]);
+  if (!items.length) return null;
+  // 最新收藏在前；没有时间戳的条目排在最后，并保持接口原有顺序。
+  items.sort((a, b) => b[1] - a[1]);
+  return items.map(([value]) => value);
 }
 
 async function likedIds() {
@@ -301,6 +332,54 @@ export async function like({ id: value, on }) {
   host.storage.remove("likedAt");
 }
 
+// 心动模式：接着当前歌曲继续推荐。接口只认「我喜欢的音乐」歌单作为上下文，seed 是接着哪首放。
+const HEARTBEAT = "heartbeat";
+
+async function heartbeatSeed() {
+  try {
+    const [played] = await recent();
+    if (played?.id) return String(played.id);
+  } catch (e) {
+    if (e.code === "signIn") throw e;
+  }
+  const [liked] = await likedIds();
+  if (liked) return String(liked);
+  fail("unavailable", "心动模式需要先收藏或播放一些歌曲");
+}
+
+export async function station({ id: value = "", seed = "" }) {
+  if (String(value).split(":")[0] !== HEARTBEAT) fail("unsupported", "不支持这个电台");
+  const user = requireAccount();
+  const explicit = Boolean(seed);
+  const start = seed ? id(seed) : await heartbeatSeed();
+  const playlistId = await likedPlaylistId(user);
+  if (!playlistId) fail("unavailable", "心动模式需要先收藏或播放一些歌曲");
+  const j = await api("/api/playmode/intelligence/list", {
+    songId: start, type: "fromPlayOne", playlistId, startMusicId: start, count: 100,
+  });
+  const seen = new Set([start]);
+  const tracks = [];
+  // 把 seed 放在队首：宿主换队列时看到队首就是正在播放的歌，会接着播完它（不重新加载），
+  // 播完后自然进入推荐。续批时 seed 是队列最后一首，宿主追加时会按 key 去重。
+  if (explicit) {
+    try {
+      const [lead] = await details([start]);
+      if (lead && !lead.unavailable) tracks.push(lead);
+    } catch (e) {
+      if (e.code === "signIn") throw e;
+    }
+  }
+  // 接口返回 { id, recommended, songInfo } 的列表；songInfo 是 v3 歌曲数据，去重并跳过 seed 本身。
+  for (const item of j.data || []) {
+    const song = item?.songInfo;
+    if (!song?.id || seen.has(String(song.id))) continue;
+    seen.add(String(song.id));
+    tracks.push(model.track(song, song.privilege));
+  }
+  if (!tracks.length) fail("unavailable", "心动模式暂时没有可推荐的歌曲");
+  return { tracks, more: true };
+}
+
 export async function savedAlbums({ offset = 0 }) {
   requireAccount();
   const j = await api("/api/album/sublist", { limit: PAGE, offset: offsetOf(offset), total: true });
@@ -322,8 +401,51 @@ export async function recent() {
 export async function home() {
   const j = await api("/api/personalized/playlist", { limit: 24, total: true, n: 1000 });
   const sections = [];
-  if (hasSession()) sections.push({ title: t("每日推荐"), links: [{ title: t("每日推荐歌曲"), page: "daily", subtitle: t("根据你的听歌喜好更新") }] });
-  sections.push({ title: t("推荐歌单"), style: "shelf", playlists: (j.result || []).map((x) => model.playlist(x, currentId())) });
+  let featured = 0;
+  if (hasSession()) {
+    // 宿主把前两个 Mode 画成大卡、第三个起画成小行。小行一行放 3 个，所以这里排成
+    // 「心动模式 / 我喜欢的音乐 / 最近播放」正好填满一行；前两张大卡用每日推荐和推荐歌单填。
+    const extra = [];
+    const account = host.storage.get("account");
+    if (account?.id) {
+      try {
+        const listId = await likedPlaylistId(account);
+        if (listId) {
+          let cover = "";
+          try { cover = await likedCover(listId); } catch (_) { /* 封面拿不到就留空 */ }
+          extra.push({ title: t("我喜欢的音乐"), subtitle: t("从你收藏的歌曲继续"), playlist: listId, imageUrl: cover });
+        }
+      } catch (_) { /* 取不到就不放这一行 */ }
+    }
+    try {
+      const tracks = (await recent()).slice(0, 50);
+      if (tracks.length) extra.push({ title: t("最近播放"), subtitle: t("接着上次的收听"), tracks });
+    } catch (_) { /* 最近播放取不到就不放这一行 */ }
+
+    const heroes = [];
+    let daily = false;
+    try {
+      const d = await api("/api/v3/discovery/recommend/songs", {});
+      const tracks = (d.data?.dailySongs || []).map((x) => model.track(x));
+      if (tracks.length) {
+        heroes.push({ title: t("每日推荐"), subtitle: t("根据你的听歌喜好更新"), tracks });
+        daily = true;
+      }
+    } catch (e) {
+      if (e.code === "signIn") throw e;
+    }
+    const playlists = (j.result || []).map((x) => model.playlist(x, currentId()));
+    while (heroes.length < 2 && featured < playlists.length) {
+      const p = playlists[featured++];
+      heroes.push({ title: p.name, subtitle: p.owner, playlist: p.id, imageUrl: p.imageUrl });
+    }
+    while (heroes.length < 2 && extra.length) heroes.push(extra.shift());
+    sections.push({ style: "modes", modes: [...heroes, { title: t("心动模式"), subtitle: t("接着当前歌曲继续推荐"), station: HEARTBEAT }, ...extra] });
+    if (!daily) sections.push({ title: t("每日推荐"), links: [{ title: t("每日推荐歌曲"), page: "daily", subtitle: t("根据你的听歌喜好更新") }] });
+    sections.push({ title: t("推荐歌单"), style: "shelf", playlists: (j.result || []).slice(featured).map((x) => model.playlist(x, currentId())) });
+  } else {
+    sections.push({ title: t("推荐歌单"), style: "shelf", playlists: (j.result || []).map((x) => model.playlist(x, currentId())) });
+  }
   sections.push({ title: t("发现音乐"), links: [{ title: t("排行榜"), page: "charts" }, { title: t("最新专辑"), page: "new-albums" }, { title: t("热门歌单"), page: "playlists:全部:0" }] });
   return { title: t("网易云音乐"), sections };
 }
@@ -400,10 +522,14 @@ export async function lyrics({ id: value }) {
 }
 
 export function trackMenu() {
-  return [{ id: "open-netease", title: t("在网易云音乐网页打开") }];
+  return [
+    { id: "heartbeat", title: t("从这里开始心动模式") },
+    { id: "open-netease", title: t("在网易云音乐网页打开") },
+  ];
 }
 
 export function menuAction({ id: action, track }) {
+  if (action === "heartbeat") return { station: { id: HEARTBEAT, seed: id(track?.id) } };
   if (action !== "open-netease") fail("unsupported", "未知菜单操作");
   host.openURL(`https://music.163.com/song?id=${id(track.id)}`);
   return {};
