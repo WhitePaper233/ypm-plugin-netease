@@ -64,5 +64,15 @@
   "Hi-Res": "Hi-Res",
   "我的云盘": "Mi música en la nube",
   "云盘中还没有歌曲": "Todavía no hay canciones en tu nube",
-  "上一页": "Página anterior"
+  "上一页": "Página anterior",
+  "心动模式": "Modo Heartbeat",
+  "接着当前歌曲继续推荐": "Sigue recomendando a partir de la canción actual",
+  "从这里开始心动模式": "Iniciar el modo Heartbeat desde aquí",
+  "心动模式需要先收藏或播放一些歌曲": "El modo Heartbeat necesita canciones que te gusten o hayas escuchado",
+  "心动模式暂时没有可推荐的歌曲": "El modo Heartbeat no tiene recomendaciones ahora mismo",
+  "不支持这个电台": "Esta emisora no es compatible",
+  "我喜欢的音乐": "Canciones que te gustan",
+  "从你收藏的歌曲继续": "Continúa con tus canciones favoritas",
+  "最近播放": "Reproducidas recientemente",
+  "接着上次的收听": "Retoma donde lo dejaste"
 }
